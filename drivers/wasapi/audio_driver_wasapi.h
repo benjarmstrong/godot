@@ -35,6 +35,7 @@
 
 #include "core/os/mutex.h"
 #include "core/os/thread.h"
+#include "servers/audio/audio_stream.h"
 #include "servers/audio_server.h"
 
 #include <audioclient.h>
@@ -58,6 +59,37 @@ class AudioDriverWASAPI : public AudioDriver {
 		String device_name;
 		String new_device;
 
+		class Resampler {
+		private:
+			enum {
+				FP_BITS = 16,
+				FP_LEN = (1 << FP_BITS),
+				FP_MASK = FP_LEN - 1,
+				INTERNAL_BUFFER_LEN = 256,
+				CUBIC_INTERP_HISTORY = 4
+			};
+			Vector<int32_t> internal_buffer;
+			int input_mix_rate;
+			int output_mix_rate;
+			int channels;
+			uint64_t mix_offset;
+			uint64_t mix_increment;
+
+		public:
+			inline int get_input_mix_rate() { return input_mix_rate; }
+			void prepare(int _input_mix_rate, int _output_mix_rate, int _channels);
+			void audio_server_process(AudioDriverWASAPI *p_driver, int32_t *p_output_buffer, int p_frames);
+
+			Resampler() :
+					input_mix_rate(0),
+					output_mix_rate(0),
+					channels(0),
+					mix_offset(0),
+					mix_increment(0) {
+			}
+		};
+		Resampler *resampler;
+
 		AudioDeviceWASAPI() :
 				audio_client(NULL),
 				render_client(NULL),
@@ -67,6 +99,7 @@ class AudioDriverWASAPI : public AudioDriver {
 				bits_per_sample(0),
 				channels(0),
 				frame_size(0),
+				resampler(nullptr),
 				device_name("Default"),
 				new_device("Default") {
 		}
@@ -83,6 +116,7 @@ class AudioDriverWASAPI : public AudioDriver {
 	unsigned int channels;
 	int mix_rate;
 	int buffer_frames;
+	int target_latency_ms; // Only used in Windows 10 onwards, otherwise WASAPI dictates the buffer size
 
 	bool thread_exited;
 	mutable bool exit_thread;
@@ -126,5 +160,5 @@ public:
 	AudioDriverWASAPI();
 };
 
+#endif // WASAPI_ENABLED
 #endif // AUDIO_DRIVER_WASAPI_H
-#endif

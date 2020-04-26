@@ -35,6 +35,8 @@
 #include "core/os/os.h"
 #include "core/project_settings.h"
 
+#include <stdint.h> // INT32_MAX
+
 #include <functiondiscoverykeys.h>
 
 #ifndef PKEY_Device_FriendlyName
@@ -51,8 +53,10 @@ DEFINE_PROPERTYKEY(PKEY_Device_FriendlyName, 0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0
 const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
 const IID IID_IAudioClient = __uuidof(IAudioClient);
+const IID IID_IAudioClient3 = __uuidof(IAudioClient3);
 const IID IID_IAudioRenderClient = __uuidof(IAudioRenderClient);
 const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
+const IID IID_IAudioClockAdjustment = __uuidof(IAudioClockAdjustment);
 
 #define SAFE_RELEASE(memory) \
 	if ((memory) != NULL) {  \
@@ -137,6 +141,57 @@ public:
 		return S_OK;
 	}
 };
+
+void AudioDriverWASAPI::AudioDeviceWASAPI::Resampler::prepare(int _input_mix_rate, int _output_mix_rate, int _channels) {
+	print_verbose("WASAPI: preparing to resample " + itos(_input_mix_rate) + "Hz to " + itos(_output_mix_rate) + "Hz");
+	input_mix_rate = _input_mix_rate;
+	output_mix_rate = _output_mix_rate;
+	channels = _channels;
+	mix_offset = 0;
+	mix_increment = uint64_t(((input_mix_rate) / double(output_mix_rate)) * double(FP_LEN));
+
+	internal_buffer.resize(channels * (INTERNAL_BUFFER_LEN + CUBIC_INTERP_HISTORY));
+	auto internal_buffer_data = internal_buffer.ptrw();
+	for (int i = 0; i < internal_buffer.size(); i++) {
+		*internal_buffer_data++ = 0;
+	}
+}
+
+void AudioDriverWASAPI::AudioDeviceWASAPI::Resampler::audio_server_process(AudioDriverWASAPI *p_driver, int32_t *p_output_buffer, int p_output_frames) {
+	for (int i = 0; i < p_output_frames; i++) {
+		uint32_t idx = CUBIC_INTERP_HISTORY + uint32_t(mix_offset >> FP_BITS);
+		for (int k = 0; k < channels; k++) {
+			float mu = (mix_offset & FP_MASK) / float(FP_LEN);
+			const float int32_to_float_factor = 1.f / (float)INT32_MAX; // Is this too inaccurate?
+			float y0 = int32_to_float_factor * (float)internal_buffer[(idx - 3) * channels + k];
+			float y1 = int32_to_float_factor * (float)internal_buffer[(idx - 2) * channels + k];
+			float y2 = int32_to_float_factor * (float)internal_buffer[(idx - 1) * channels + k];
+			float y3 = int32_to_float_factor * (float)internal_buffer[(idx - 0) * channels + k];
+
+			float mu2 = mu * mu;
+			float a0 = y3 - y2 - y0 + y1;
+			float a1 = y0 - y1 - a0;
+			float a2 = y2 - y0;
+			float a3 = y1;
+
+			float result = (a0 * mu * mu2 + a1 * mu2 + a2 * mu + a3);
+			// Convert result from range -1.0,1.0 to range -INT32_MAX,INT32_MAX
+			result = CLAMP(result, -1.0, 1.0);
+			int32_t vl = result * ((1 << 20) - 1);
+			int32_t vl2 = (vl < 0 ? -1 : 1) * (ABS(vl) << 11);
+			p_output_buffer[i * channels + k] = vl2;
+		}
+
+		mix_offset += mix_increment;
+		while ((mix_offset >> FP_BITS) >= INTERNAL_BUFFER_LEN) {
+			for (int l = 0; l < CUBIC_INTERP_HISTORY * channels; l++) {
+				internal_buffer.set(l, internal_buffer[(INTERNAL_BUFFER_LEN * channels) + l]);
+			}
+			p_driver->audio_server_process((INTERNAL_BUFFER_LEN), internal_buffer.ptrw() + (CUBIC_INTERP_HISTORY * channels));
+			mix_offset -= ((INTERNAL_BUFFER_LEN) << FP_BITS);
+		}
+	}
+}
 
 static CMMNotificationClient notif_client;
 
@@ -224,7 +279,19 @@ Error AudioDriverWASAPI::audio_device_init(AudioDeviceWASAPI *p_device, bool p_c
 		ERR_PRINT("WASAPI: RegisterEndpointNotificationCallback error");
 	}
 
-	hr = device->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&p_device->audio_client);
+	bool using_audio_client_3 = !p_capture; // IID_IAudioClient3 is only used for adjustable output latency (not input)
+	if (using_audio_client_3) {
+		hr = device->Activate(IID_IAudioClient3, CLSCTX_ALL, NULL, (void **)&p_device->audio_client);
+		if (hr != S_OK) {
+			// IID_IAudioClient3 will never activate on OS versions before Windows 10.
+			// Older Windows versions should fall back gracefully.
+			using_audio_client_3 = false;
+		}
+	}
+	if (!using_audio_client_3) {
+		hr = device->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&p_device->audio_client);
+	}
+
 	SAFE_RELEASE(device)
 
 	if (reinit) {
@@ -233,6 +300,16 @@ Error AudioDriverWASAPI::audio_device_init(AudioDeviceWASAPI *p_device, bool p_c
 		}
 	} else {
 		ERR_FAIL_COND_V(hr != S_OK, ERR_CANT_OPEN);
+	}
+
+	if (using_audio_client_3) {
+		AudioClientProperties audioProps;
+		audioProps.cbSize = sizeof(AudioClientProperties);
+		audioProps.bIsOffload = FALSE;
+		audioProps.eCategory = AudioCategory_GameEffects;
+
+		hr = ((IAudioClient3 *)p_device->audio_client)->SetClientProperties(&audioProps);
+		ERR_FAIL_COND_V_MSG(hr != S_OK, ERR_CANT_OPEN, "WASAPI: SetClientProperties failed with error 0x" + String::num_uint64(hr, 16) + ".");
 	}
 
 	hr = p_device->audio_client->GetMixFormat(&pwfex);
@@ -288,15 +365,53 @@ Error AudioDriverWASAPI::audio_device_init(AudioDeviceWASAPI *p_device, bool p_c
 		}
 	}
 
-	DWORD streamflags = 0;
-	if ((DWORD)mix_rate != pwfex->nSamplesPerSec) {
-		streamflags |= AUDCLNT_STREAMFLAGS_RATEADJUST;
-		pwfex->nSamplesPerSec = mix_rate;
-		pwfex->nAvgBytesPerSec = pwfex->nSamplesPerSec * pwfex->nChannels * (pwfex->wBitsPerSample / 8);
+	if (p_device->resampler != nullptr) {
+		memdelete(p_device->resampler);
+		p_device->resampler = nullptr;
 	}
 
-	hr = p_device->audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, streamflags, p_capture ? REFTIMES_PER_SEC : 0, 0, pwfex, NULL);
-	ERR_FAIL_COND_V_MSG(hr != S_OK, ERR_CANT_OPEN, "WASAPI: Initialize failed with error 0x" + String::num_uint64(hr, 16) + ".");
+	if (!using_audio_client_3) {
+		DWORD streamflags = 0;
+		if ((DWORD)mix_rate != pwfex->nSamplesPerSec) {
+			streamflags |= AUDCLNT_STREAMFLAGS_RATEADJUST;
+			pwfex->nSamplesPerSec = mix_rate;
+			pwfex->nAvgBytesPerSec = pwfex->nSamplesPerSec * pwfex->nChannels * (pwfex->wBitsPerSample / 8);
+		}
+		hr = p_device->audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, streamflags, p_capture ? REFTIMES_PER_SEC : 0, 0, pwfex, NULL);
+		ERR_FAIL_COND_V_MSG(hr != S_OK, ERR_CANT_OPEN, "WASAPI: Initialize failed with error 0x" + String::num_uint64(hr, 16) + ".");
+	} else {
+		IAudioClient3 *device_audio_client_3 = (IAudioClient3 *)p_device->audio_client;
+		// IAudioClient3 won't accept AUDCLNT_STREAMFLAGS_RATEADJUST so resampling is required
+		if (mix_rate != pwfex->nSamplesPerSec) {
+			p_device->resampler = memnew(AudioDeviceWASAPI::Resampler());
+			p_device->resampler->prepare(mix_rate, (int)pwfex->nSamplesPerSec, p_device->channels);
+		}
+
+		UINT32 default_period_frames, fundamental_period_frames, min_period_frames, max_period_frames;
+		hr = device_audio_client_3->GetSharedModeEnginePeriod(
+				pwfex,
+				&default_period_frames,
+				&fundamental_period_frames,
+				&min_period_frames,
+				&max_period_frames);
+		ERR_FAIL_COND_V_MSG(hr != S_OK, ERR_CANT_OPEN, "WASAPI: GetSharedModeEnginePeriod failed with error 0x" + String::num_uint64(hr, 16) + ".");
+
+		// Period frames must be an integral multiple of fundamental_period_frames or IAudioClient3 initialization will fail,
+		// so we need to select the closest multiple to the user-specified latency.
+		auto desired_period_frames = target_latency_ms * mix_rate / 1000;
+		auto period_frames = (desired_period_frames / fundamental_period_frames) * fundamental_period_frames;
+		if (ABS((int64_t)period_frames - (int64_t)desired_period_frames) > ABS((int64_t)(period_frames + fundamental_period_frames) - (int64_t)desired_period_frames)) {
+			period_frames = period_frames + fundamental_period_frames;
+		}
+		period_frames = CLAMP(period_frames, min_period_frames, max_period_frames);
+		print_verbose("WASAPI: fundamental_period_frames = " + itos(fundamental_period_frames));
+		print_verbose("WASAPI: min_period_frames = " + itos(min_period_frames));
+		print_verbose("WASAPI: max_period_frames = " + itos(max_period_frames));
+		print_verbose("WASAPI: selected a period frame size of " + itos(period_frames));
+
+		hr = device_audio_client_3->InitializeSharedAudioStream(0, period_frames, pwfex, NULL);
+		ERR_FAIL_COND_V_MSG(hr != S_OK, ERR_CANT_OPEN, "WASAPI: InitializeSharedAudioStream failed with error 0x" + String::num_uint64(hr, 16) + ".");
+	}
 
 	if (p_capture) {
 		hr = p_device->audio_client->GetService(IID_IAudioCaptureClient, (void **)&p_device->capture_client);
@@ -373,7 +488,10 @@ Error AudioDriverWASAPI::audio_device_finish(AudioDeviceWASAPI *p_device) {
 		if (p_device->audio_client) {
 			p_device->audio_client->Stop();
 		}
-
+		if (p_device->resampler != nullptr) {
+			memdelete(p_device->resampler);
+			p_device->resampler = nullptr;
+		}
 		p_device->active = false;
 	}
 
@@ -398,6 +516,8 @@ Error AudioDriverWASAPI::init() {
 
 	mix_rate = GLOBAL_DEF_RST("audio/mix_rate", DEFAULT_MIX_RATE);
 
+	target_latency_ms = GLOBAL_DEF_RST("audio/output_latency", DEFAULT_OUTPUT_LATENCY);
+
 	Error err = init_render_device();
 	if (err != OK) {
 		ERR_PRINT("WASAPI: init_render_device error");
@@ -413,7 +533,6 @@ Error AudioDriverWASAPI::init() {
 }
 
 int AudioDriverWASAPI::get_mix_rate() const {
-
 	return mix_rate;
 }
 
@@ -568,7 +687,11 @@ void AudioDriverWASAPI::thread_func(void *p_udata) {
 			ad->start_counting_ticks();
 
 			if (ad->audio_output.active) {
-				ad->audio_server_process(ad->buffer_frames, ad->samples_in.ptrw());
+				if (ad->audio_output.resampler == nullptr) {
+					ad->audio_server_process(ad->buffer_frames, ad->samples_in.ptrw());
+				} else {
+					ad->audio_output.resampler->audio_server_process(ad, ad->samples_in.ptrw(), ad->buffer_frames);
+				}
 			} else {
 				for (int i = 0; i < ad->samples_in.size(); i++) {
 					ad->samples_in.write[i] = 0;
@@ -870,6 +993,7 @@ AudioDriverWASAPI::AudioDriverWASAPI() {
 
 	channels = 0;
 	mix_rate = 0;
+	target_latency_ms = 0;
 	buffer_frames = 0;
 
 	thread_exited = false;
